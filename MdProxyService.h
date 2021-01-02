@@ -11,7 +11,7 @@
 #define WORKER_THREADS_PER_PROCESSOR 2
 
 //Buffer Length 
-#define MAX_BUFFER_LEN 256
+#define MAX_BUFFER_LEN 8192
 
 //Time out interval for wait calls
 #define WAIT_TIMEOUT_INTERVAL 100
@@ -41,7 +41,7 @@ CRITICAL_SECTION g_csClientList; //Need to protect the client list
 //Global I/O completion port handle
 HANDLE g_hIOCompletionPort = NULL;
 
-class CClientContext  //To store and manage client related information
+class SocketContext  //To store and manage client related information
 {
 private:
 
@@ -55,9 +55,21 @@ private:
 	int               m_nOpCode; //will be used by the worker thread to decide what operation to perform
 	char              m_szBuffer[MAX_BUFFER_LEN];
 
+	SocketContext* pFwd_SocketContext;
+
 public:
 
 	//Get/Set calls
+	void SetFwdScoketContext(SocketContext* socketContext)
+	{
+		pFwd_SocketContext = socketContext;
+	}
+
+	SocketContext* GetFwdScoketContext()
+	{
+		return pFwd_SocketContext;
+	}
+
 	void SetOpCode(int n)
 	{
 		m_nOpCode = n;
@@ -146,7 +158,7 @@ public:
 	}
 
 	//Constructor
-	CClientContext()
+	SocketContext()
 	{
 		m_pol = new OVERLAPPED;
 		m_pwbuf = new WSABUF;
@@ -166,14 +178,11 @@ public:
 	}
 
 	//destructor
-	~CClientContext()
+	~SocketContext()
 	{
-		//Wait for the pending operations to complete
-		while (!HasOverlappedIoCompleted(m_pol))
-		{
-			Sleep(0);
-		}
-
+		//Cancel all IO operations
+		CancelIoEx((HANDLE)m_Socket, m_pol);
+		SleepEx(0, TRUE); // the completion will be called here
 		closesocket(m_Socket);
 
 		//Cleanup
@@ -185,7 +194,7 @@ public:
 //Vector to store pointers of dynamically allocated ClientContext.
 //map class can also be used.
 //Link list can also be created.
-std::vector<CClientContext*> g_ClientContext;
+std::vector<SocketContext*> g_ClientContext;
 
 //global functions
 bool InitializeIOCP();
@@ -194,12 +203,13 @@ void CleanUp();
 void DeInitialize();
 DWORD WINAPI AcceptThread(LPVOID lParam);
 void AcceptConnection(SOCKET ListenSocket);
-bool AssociateWithIOCP(CClientContext* pClientContext);
+bool AssociateWithIOCP(SocketContext* pClientContext);
 DWORD WINAPI WorkerThread(LPVOID lpParam);
 void WriteToConsole(const char* szFormat, ...);
-void AddToClientList(CClientContext* pClientContext);
-void RemoveFromClientListAndFreeMemory(CClientContext* pClientContext);
+void AddToClientList(SocketContext* pClientContext);
+void RemoveFromClientListAndFreeMemory(SocketContext* pClientContext, int depth = 1);
 void CleanClientList();
 int GetNoOfProcessors();
+SocketContext* InitRemoteConnection(SocketContext* pClientContext);
 
 #endif
