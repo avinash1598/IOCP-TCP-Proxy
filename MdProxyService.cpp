@@ -6,18 +6,41 @@
 #include <string.h>
 #include <winsock2.h>
 #include <vector>
+#include <Mstcpip.h>
+#include <intsafe.h>
 #pragma comment(lib, "Ws2_32.lib")
 
 #include "MdProxyService.h"
+#include "KernelCommunicator.h"
+
+HANDLE g_hShutdownEvent = NULL;
+int g_nThreads = 0;
+HANDLE* g_phWorkerThreads = NULL;
+HANDLE g_hAcceptThread = NULL;
+CRITICAL_SECTION g_csConsole; 
+CRITICAL_SECTION g_csClientList; 
+HANDLE g_hIOCompletionPort = NULL;
+std::vector<SocketContext*> g_ClientContext;
+WSAEVENT g_hAcceptEvent;
+
 
 int main(int argc, char* argv[])
 {
+	//Update user application process id to WFP kernel driver
+	if (TRUE != UpdateKernelWithUserAppProcessId())
+	{
+		printf_s("\nError updating data to kernel driver.");
+		return 1;
+	}
+
+	/*
 	//Validate the input
 	if (argc < 2)
 	{
 		printf("\nUsage: %s port.", argv[0]);
 		return 1;
-	}
+	}*/
+	printf("\nUsage: %s port.", PROXY_SERVER_PORT);
 
 	if (false == Initialize())
 	{
@@ -27,7 +50,7 @@ int main(int argc, char* argv[])
 	SOCKET ListenSocket;
 
 	struct sockaddr_in ServerAddress;
-
+	
 	//Overlapped I/O follows the model established in Windows and can be performed only on 
 	//sockets created through the WSASocket function 
 	ListenSocket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -47,7 +70,7 @@ int main(int argc, char* argv[])
 
 	//Port number will be supplied as a command line argument
 	int nPortNo;
-	nPortNo = atoi(argv[1]);
+	nPortNo = atoi(PROXY_SERVER_PORT);
 
 	//Fill up the address structure
 	ServerAddress.sin_family = AF_INET;
@@ -269,9 +292,9 @@ void AcceptConnection(SOCKET ListenSocket)
 {
 	sockaddr_in ClientAddress;
 	int nClientLength = sizeof(ClientAddress);
-
+	
 	//Accept remote connection attempt from the client
-	SOCKET Socket = accept(ListenSocket, (sockaddr*)&ClientAddress, &nClientLength);
+	SOCKET Socket = WSAAccept(ListenSocket, (sockaddr*)&ClientAddress, &nClientLength, NULL, 0);
 
 	if (INVALID_SOCKET == Socket)
 	{
@@ -332,16 +355,108 @@ void AcceptConnection(SOCKET ListenSocket)
 //TODO: get destination server address here
 SocketContext* InitRemoteConnection(SocketContext* pClientContext) 
 {
-	SOCKET rSocket;
-	struct sockaddr_in RemoteAddr;
+	const SIZE_T REDIRECT_RECORDS_SIZE = 2048;
+	const SIZE_T REDIRECT_CONTEXT_SIZE = sizeof(SOCKADDR_STORAGE) * 2;
 
-	rSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (INVALID_SOCKET == rSocket) 
+	UINT32 status;
+	SOCKET remoteProxySocket;
+	SocketContext* pRemoteSockContext = NULL;
+
+	BYTE** pRedirectRecords = 0;
+	BYTE** pRedirectContext = 0;
+	SIZE_T redirectRecordsSize = 0;
+	SIZE_T redirectContextSize = 0;
+	SIZE_T redirectRecordsSet = 0;
+	
+	SOCKADDR_STORAGE* pRemoteSockAddrStorage = 0;
+
+	//Allocate memory in heap else winsock will throw 10014 error
+	//Initialization on top causes memory to be allocated in stack
+	HLPR_NEW_ARRAY(pRedirectRecords, BYTE*, REDIRECT_RECORDS_SIZE);
+	HLPR_NEW_ARRAY(pRedirectContext, BYTE*, REDIRECT_CONTEXT_SIZE);
+	HLPR_NEW_ARRAY(pRemoteSockAddrStorage, SOCKADDR_STORAGE, 1);
+	
+	//Opaque data to be set on proxy connection
+	status = WSAIoctl(pClientContext->GetSocket(),
+					  SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS,
+					  0, 
+					  0,
+					  (BYTE*)pRedirectRecords,
+					  REDIRECT_RECORDS_SIZE,
+					  (LPDWORD)&redirectRecordsSize,
+					  0, 
+					  0);
+
+	if (NO_ERROR != status)
+	{
+		WriteToConsole("\nUnable to get redirect records from socket: %ld", WSAGetLastError());
+		goto Exit;
+	}
+	
+	//Callout allocated data, contains original destination information
+	status = WSAIoctl(pClientContext->GetSocket(),
+					  SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
+					  0,
+				      0,
+					  (BYTE*)pRedirectContext,
+					  REDIRECT_CONTEXT_SIZE,
+					  (LPDWORD)&redirectContextSize,
+					  0,
+					  0);
+
+	if (NO_ERROR != status)
+	{
+		WriteToConsole("\nUnable to get redirect context from socket: %ld", WSAGetLastError());
+		goto Exit;
+	}
+	
+	// copy remote address
+	RtlCopyMemory(pRemoteSockAddrStorage, 
+				  &(((SOCKADDR_STORAGE*)pRedirectContext)[0]), 
+				  sizeof(SOCKADDR_STORAGE));
+	
+	//Cleanup, init and copy
+	//ZeroMemory((char*)&RemoteAddr, sizeof(RemoteAddr));
+	//CopyMemory((SOCKADDR_IN*)&RemoteAddr, pRemoteSockAddrStorage, sizeof(SOCKADDR_STORAGE));
+
+	//WriteToConsole("Remote address - %s", inet_ntoa(RemoteAddr.sin_addr));
+
+	remoteProxySocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	
+	if (INVALID_SOCKET == remoteProxySocket)
 	{
 		WriteToConsole("\nError occured while opening socket: %ld", WSAGetLastError());
-		return NULL;
+		goto Exit;
 	}
 
+	status = WSAIoctl(remoteProxySocket,
+					  SIO_SET_WFP_CONNECTION_REDIRECT_RECORDS,
+					  (BYTE*)pRedirectRecords,
+					  (DWORD)redirectRecordsSize,
+					  0,
+					  0,
+					  (LPDWORD)&redirectRecordsSet,
+					  0,
+					  0);
+
+	if (NO_ERROR != status)
+	{
+		WriteToConsole("\nUnable to set redirect records on socket: %ld", WSAGetLastError());
+		goto Exit;
+	}
+
+	/*
+		Check no longer valid:
+		Refer this: https://social.msdn.microsoft.com/Forums/en-US/be79cc7f-e2ff-47ce-bc83-f79307680042/seting-redirect-records-on-the-proxy-connection-socket-correctly?forum=wfp
+	*/
+	if (redirectRecordsSize != redirectRecordsSet)
+	{
+		WriteToConsole("\nRedirect record size mismatch. %ld and %ld", 
+					   redirectRecordsSize, redirectRecordsSet);
+		//goto Exit;
+	}
+
+	/*
 	//Cleanup and Init with 0 the ServerAddress
 	ZeroMemory((char*)&RemoteAddr, sizeof(RemoteAddr));
 
@@ -349,18 +464,21 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 	RemoteAddr.sin_family = AF_INET;
 	RemoteAddr.sin_addr.s_addr = inet_addr("18.136.42.214");
 	RemoteAddr.sin_port = htons(80);
+	*/
+	
+	status = WSAConnect(remoteProxySocket, (SOCKADDR*)pRemoteSockAddrStorage, sizeof(SOCKADDR_STORAGE), 0, 0, 0, 0);
 
-	if (SOCKET_ERROR == connect(rSocket, (struct sockaddr*) & RemoteAddr, sizeof(RemoteAddr)))
+	if (SOCKET_ERROR == status)
 	{
-		closesocket(rSocket);
 		WriteToConsole("\nError occured while connecting to remote server: %ld", WSAGetLastError());
-		return NULL;
+		goto Exit;
 	}
-
-	SocketContext* pRemoteSockContext = new SocketContext;
+	
+	pRemoteSockContext = new SocketContext;
 	
 	pRemoteSockContext->SetOpCode(OP_WRITE);
-	pRemoteSockContext->SetSocket(rSocket);
+	pRemoteSockContext->SetProxySocket(TRUE);
+	pRemoteSockContext->SetSocket(remoteProxySocket);
 	pRemoteSockContext->SetFwdScoketContext(pClientContext);
 
 	AddToClientList(pRemoteSockContext);
@@ -370,7 +488,22 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 		WriteToConsole("\nAssociated remote socket with IOCP.");
 	}
 
-	return pRemoteSockContext;
+Exit:
+	HLPR_DELETE_ARRAY(pRedirectContext);
+	HLPR_DELETE_ARRAY(pRedirectRecords);
+	HLPR_DELETE_ARRAY(pRemoteSockAddrStorage);
+
+	if (pRemoteSockContext != NULL) 
+	{
+		return pRemoteSockContext;
+	}
+
+	if (remoteProxySocket)
+	{
+		closesocket(remoteProxySocket);
+	}
+
+	return NULL;
 }
 
 bool AssociateWithIOCP(SocketContext* pClientContext)
@@ -391,6 +524,7 @@ bool AssociateWithIOCP(SocketContext* pClientContext)
 	return true;
 }
 
+/*
 //Worker thread will service IOCP requests
 DWORD WINAPI WorkerThread(LPVOID lpParam)
 {
@@ -432,6 +566,15 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 			RemoveFromClientListAndFreeMemory(pClientContext);
 			continue;
 		}
+		
+		if (TRUE == pClientContext->GetProxySocket())
+		{
+			WriteToConsole("\nPROXY SOCKET: READ or WRITE operation needs to be done.");
+		}
+		else
+		{
+			WriteToConsole("\nLOCAL SOCKET: READ or WRITE operation needs to be done.");
+		}
 
 		switch (pClientContext->GetOpCode())
 		{
@@ -465,6 +608,15 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 			}
 			else
 			{
+				if (TRUE == pClientContext->GetProxySocket())
+				{
+					WriteToConsole("\nPROXY SOCKET: WSARecv.");
+				}
+				else
+				{
+					WriteToConsole("\nLOCAL SOCKET: WSARecv.");
+				}
+
 				//Once the data is successfully received, we will print it.
 				pClientContext->SetOpCode(OP_WRITE);
 				pClientContext->ResetWSABUF();
@@ -542,6 +694,7 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 
 	return 0;
 }
+*/
 
 //Function to synchronize console output
 //Threads need to be synchronized while they write to console.

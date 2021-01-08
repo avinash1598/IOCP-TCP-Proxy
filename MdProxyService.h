@@ -16,30 +16,63 @@
 //Time out interval for wait calls
 #define WAIT_TIMEOUT_INTERVAL 100
 
+//Proxy service port 
+#define PROXY_SERVER_PORT "1598"
+
+//Allocate memory with new and zero out its contents.
+#define HLPR_NEW_ARRAY(pPtr, object, count)           \
+   do                                                 \
+   {                                                  \
+      size_t SAFE_SIZE = 0;                           \
+      HLPR_DELETE_ARRAY(pPtr);                        \
+      if(SizeTMult(sizeof(object),                    \
+                   (size_t)count,                     \
+                   &SAFE_SIZE) == S_OK &&             \
+         SAFE_SIZE >= (sizeof(object) * count))       \
+      {                                               \
+         pPtr = new object[count];                    \
+         if(pPtr)                                     \
+            SecureZeroMemory(pPtr,                    \
+                             SAFE_SIZE);              \
+      }                                               \
+      else                                            \
+      {                                               \
+         break;                                       \
+      }                                               \
+   }while(pPtr == 0)
+
+//Free memory allocated with new[] and set the pointer to 0
+#define HLPR_DELETE_ARRAY(pPtr) \
+   if(pPtr)                     \
+   {                            \
+      delete[] pPtr;            \
+      pPtr = 0;                 \
+   }
+
 //Graceful shutdown Event
 //For this simple implementation,
 //We can use global variable as well.
 //Wanted to demonstrate use of event
 //for shutdown
-HANDLE g_hShutdownEvent = NULL;
+extern HANDLE g_hShutdownEvent;
 
 //Number of threads to be created.
-int g_nThreads = 0;
+extern int g_nThreads;
 
 //To store handle of worker threads
-HANDLE* g_phWorkerThreads = NULL;
+extern HANDLE* g_phWorkerThreads;
 
 //Handle for Accept related thread
-HANDLE g_hAcceptThread = NULL;
+extern HANDLE g_hAcceptThread;
 
 //Network Event for Accept
-WSAEVENT				g_hAcceptEvent;
+extern WSAEVENT	g_hAcceptEvent;
 
-CRITICAL_SECTION g_csConsole; //When threads write to console we need mutual exclusion
-CRITICAL_SECTION g_csClientList; //Need to protect the client list
+extern CRITICAL_SECTION g_csConsole; //When threads write to console we need mutual exclusion
+extern CRITICAL_SECTION g_csClientList; //Need to protect the client list
 
 //Global I/O completion port handle
-HANDLE g_hIOCompletionPort = NULL;
+extern HANDLE g_hIOCompletionPort;
 
 class SocketContext  //To store and manage client related information
 {
@@ -55,6 +88,8 @@ private:
 	int               m_nOpCode; //will be used by the worker thread to decide what operation to perform
 	char              m_szBuffer[MAX_BUFFER_LEN];
 
+	BOOL              m_ProxySocket;
+
 	SocketContext* pFwd_SocketContext;
 
 public:
@@ -68,6 +103,16 @@ public:
 	SocketContext* GetFwdScoketContext()
 	{
 		return pFwd_SocketContext;
+	}
+
+	void SetProxySocket(BOOL value) 
+	{
+		m_ProxySocket = value;
+	}
+
+	BOOL GetProxySocket()
+	{
+		return m_ProxySocket;
 	}
 
 	void SetOpCode(int n)
@@ -175,6 +220,7 @@ public:
 		m_nOpCode = 0;
 		m_nTotalBytes = 0;
 		m_nSentBytes = 0;
+		m_ProxySocket = FALSE;
 	}
 
 	//destructor
@@ -194,7 +240,7 @@ public:
 //Vector to store pointers of dynamically allocated ClientContext.
 //map class can also be used.
 //Link list can also be created.
-std::vector<SocketContext*> g_ClientContext;
+extern std::vector<SocketContext*> g_ClientContext;
 
 //global functions
 bool InitializeIOCP();
