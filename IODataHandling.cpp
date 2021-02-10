@@ -1,94 +1,26 @@
 #include <winsock2.h>
 #include <vector>
+#include <memory>
+#include <thread>
 
 #include "MdProxyService.h"
+#include "SocketContext.h"
 
-/*
-No need of synchronization as long as this function works with local variables
-*/
-BOOL ForwardData(
-	SocketContext* pClientContext,
-	int nThreadNo,
-	DWORD dwBytesTransfered
-)
-{
-	BOOL status = TRUE;
-
-	WSABUF* p_wbuf;
-	OVERLAPPED* p_ol;
-
-	int nBytesSent = 0;
-	DWORD dwBytes = 0, dwFlags = 0;
-	char szBuffer[MAX_BUFFER_LEN];
-	SocketContext* pFwd_SocketContext;
-
-	//Display the message we recevied
-	pClientContext->GetBuffer(szBuffer);
-
-	WriteToConsole("\nThread %d: The following message was received: %s", nThreadNo, szBuffer);
-
-	//Forward message to fwd socket
-	pFwd_SocketContext = pClientContext->GetFwdScoketContext();
-
-	if (pFwd_SocketContext == NULL)
-	{
-		WriteToConsole("\nThread %d: No Fwd Socket associated with this socket context.", nThreadNo);
-
-		//Let's not work with this client
-		RemoveFromClientListAndFreeMemory(pClientContext);
-		status = FALSE;
-		goto Exit;
-	}
-
-	p_wbuf = pFwd_SocketContext->GetWSABUFPtr();
-	p_ol = pFwd_SocketContext->GetOVERLAPPEDPtr();
-
-	pFwd_SocketContext->SetOpCode(OP_WRITE);
-
-	pFwd_SocketContext->SetTotalBytes(dwBytesTransfered);
-	pFwd_SocketContext->SetSentBytes(0);
-
-	p_wbuf->len = dwBytesTransfered;
-	pFwd_SocketContext->SetBuffer(szBuffer);
-
-	dwFlags = 0;
-
-	nBytesSent = WSASend(pFwd_SocketContext->GetSocket(), p_wbuf, 1,
-		&dwBytes, dwFlags, p_ol, NULL);
-
-	if ((SOCKET_ERROR == nBytesSent) && (WSA_IO_PENDING != WSAGetLastError()))
-	{
-		WriteToConsole("\nThread %d: Error occurred while executing WSASend().", nThreadNo);
-
-		//Let's not work with this client
-		RemoveFromClientListAndFreeMemory(pFwd_SocketContext);
-		status = FALSE;
-		goto Exit;
-	}
-
-Exit:
-	return status;
-}
-
-BOOL PostWSARecv(
-	SocketContext* pClientContext
-)
-{
-}
 
 DWORD WINAPI WorkerThread(LPVOID lpParam)
 {
 	int nThreadNo = (int)lpParam;
 
-	void* lpContext = NULL;
-	OVERLAPPED* pOverlapped = NULL;
-	SocketContext* pClientContext = NULL;
+	void* lpContext = nullptr;
+	OVERLAPPED* pOverlapped = nullptr;
+	//std::shared_ptr<SocketContext> pClientContext = nullptr;
 	DWORD dwBytesTransfered = 0;
-	int nBytesRecv = 0;
+	char sock_type[] = "LOCAL SOCKET";
 
 	//Worker thread will be around to process requests, until a Shutdown event is not Signaled.
 	while (WAIT_OBJECT_0 != WaitForSingleObject(g_hShutdownEvent, 0))
 	{
+		BOOL status = TRUE;
 		BOOL bReturn = GetQueuedCompletionStatus(
 			g_hIOCompletionPort,
 			&dwBytesTransfered,
@@ -99,121 +31,88 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 		if (NULL == lpContext)
 		{
 			//We are shutting down
+			status = FALSE;
 			break;
 		}
+		WriteToConsole("\nThread %d: Inside worker thread: %ld", nThreadNo);
+		std::shared_ptr<SocketContext>* temp = static_cast<std::shared_ptr<SocketContext>*>(lpContext);
+		std::shared_ptr<SocketContext> pClientContext = *temp;
+		//std::shared_ptr<SocketContext> pClientContext = std::make_shared<SocketContext>(*temp->get());
+		//WriteToConsole("\nThread %d: Number of objects sharing this socket: %ld", nThreadNo, pClientContext.use_count());
+		//create smart_pointer instead
+		//SocketContext* pClientContext = (SocketContext*)lpContext;
+		PIO_OPERATION_DATA pIoData = (PIO_OPERATION_DATA)pOverlapped;
 
-		//Get the client context
-		pClientContext = (SocketContext*)lpContext;
-
-		if ((FALSE == bReturn) || ((TRUE == bReturn) && (0 == dwBytesTransfered)))
-		{
-			//Client connection gone, remove it.
-			RemoveFromClientListAndFreeMemory(pClientContext);
-			continue;
-		}
-
+		//Socket type
 		if (TRUE == pClientContext->GetProxySocket())
 		{
-			WriteToConsole("\nPROXY SOCKET: READ or WRITE operation needs to be done.");
+			WriteToConsole("\nThread %d PROXY SOCKET: Socket id %d.", nThreadNo, pClientContext->GetId());
+			strcpy(sock_type, "PROXY SOCKET");
 		}
 		else
 		{
-			WriteToConsole("\nLOCAL SOCKET: READ or WRITE operation needs to be done.");
+			WriteToConsole("\nThread %d LOCAL SOCKET: Socket Id %d.", nThreadNo, pClientContext->GetId());
+			strcpy(sock_type, "LOCAL SOCKET");
+		}
 
-			switch (pClientContext->GetOpCode())
+		//Check is socket connection is closed
+		if ((FALSE == bReturn) || ((TRUE == bReturn) && (0 == dwBytesTransfered)))
+		{
+			WriteToConsole("\nThread %d %s: Client connection gone.", nThreadNo, sock_type);
+			status = FALSE;
+			goto Exit;
+		}
+
+		try
+		{
+			switch (pIoData->IoType)
 			{
 			case OP_READ:
 
-				WriteToConsole("\nReceived data from local application. Redirecting it to remote socket...");
+				WriteToConsole("\nThread %d %s: Received %ld bytes.", nThreadNo, sock_type, dwBytesTransfered);
 
-				if (FALSE == ForwardData(pClientContext, nThreadNo, dwBytesTransfered))
+				//Forward data no longer can be a SocketContext class 
+				//memebr function.
+				//pClientContext->GetRecvBuffer();
+				if (FALSE == pClientContext->Forward(dwBytesTransfered))
 				{
-					//Do nothing. Exit this iteration and move to next.
-					continue;
+					WriteToConsole("\nThread %d %s: Error occured while forwading data.", nThreadNo, sock_type);
+					status = FALSE;
+					goto Exit;
 				}
 
+				if (FALSE == pClientContext->Recv())
+				{
+					WriteToConsole("\nThread %d %s: Error occured while receiving data.", nThreadNo, sock_type);
+					status = FALSE;
+					goto Exit;
+				}
 
+				break;
+
+			case OP_WRITE:
+
+				WriteToConsole("\nThread %d %s: Sent %ld bytes.", nThreadNo, sock_type, dwBytesTransfered);
+
+				break;
+
+			default:
+				break;
 			}
-
+		}
+		catch (const char* message)
+		{
+			WriteToConsole("\nThread %d %s: Exception occured: %s.", message);
 		}
 
-
-		/*
-		switch (pClientContext->GetOpCode())
+	Exit:
+		if (FALSE == status)
 		{
-		case OP_READ:
+			WriteToConsole("\nThread %d %s: Status is FALSE.", nThreadNo, sock_type);
+			//RemoveFromClientListAndCleanUpMemory(pClientContext);
+		}
 
-			p_wbuf = pClientContext->GetWSABUFPtr();
-			p_ol = pClientContext->GetOVERLAPPEDPtr();
-
-			pClientContext->IncrSentBytes(dwBytesTransfered);
-
-			//Write operation was finished, see if all the data was sent.
-			//Else post another write.
-			if (pClientContext->GetSentBytes() < pClientContext->GetTotalBytes())
-			{
-				pClientContext->SetOpCode(OP_READ);
-
-				p_wbuf->buf += pClientContext->GetSentBytes(); //why this??
-				p_wbuf->len = pClientContext->GetTotalBytes() - pClientContext->GetSentBytes();
-
-				dwFlags = 0;
-
-				//Overlapped send
-				nBytesSent = WSASend(pClientContext->GetSocket(), p_wbuf, 1,
-					&dwBytes, dwFlags, p_ol, NULL);
-
-				if ((SOCKET_ERROR == nBytesSent) && (WSA_IO_PENDING != WSAGetLastError()))
-				{
-					//Let's not work with this client
-					RemoveFromClientListAndFreeMemory(pClientContext);
-				}
-			}
-			else
-			{
-				if (TRUE == pClientContext->GetProxySocket())
-				{
-					WriteToConsole("\nPROXY SOCKET: WSARecv.");
-				}
-				else
-				{
-					WriteToConsole("\nLOCAL SOCKET: WSARecv.");
-				}
-
-				//Once the data is successfully received, we will print it.
-				pClientContext->SetOpCode(OP_WRITE);
-				pClientContext->ResetWSABUF();
-
-				dwFlags = 0;
-
-				//Get the data.
-				nBytesRecv = WSARecv(pClientContext->GetSocket(), p_wbuf, 1,
-					&dwBytes, &dwFlags, p_ol, NULL);
-
-				if ((SOCKET_ERROR == nBytesRecv) && (WSA_IO_PENDING != WSAGetLastError()))
-				{
-					WriteToConsole("\nThread %d: Error occurred while executing WSARecv().", nThreadNo);
-
-					//Let's not work with this client
-					RemoveFromClientListAndFreeMemory(pClientContext);
-				}
-			}
-
-			break;
-
-		case OP_WRITE:
-
-			
-
-			break;
-
-		default:
-			//We should never be reaching here, under normal circumstances.
-			break;
-		} // switch
-
-		*/
-
+		//WriteToConsole("\nThread %d: Number of objects sharing this socket: %ld", nThreadNo, pClientContext.use_count());
 	} // while
 
 	return 0;

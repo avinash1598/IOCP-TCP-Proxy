@@ -6,12 +6,15 @@
 #include <string.h>
 #include <winsock2.h>
 #include <vector>
+//#include <unordered_map>
 #include <Mstcpip.h>
 #include <intsafe.h>
+#include <memory>
 #pragma comment(lib, "Ws2_32.lib")
 
 #include "MdProxyService.h"
 #include "KernelCommunicator.h"
+#include "SocketContext.h"
 
 HANDLE g_hShutdownEvent = NULL;
 int g_nThreads = 0;
@@ -19,10 +22,14 @@ HANDLE* g_phWorkerThreads = NULL;
 HANDLE g_hAcceptThread = NULL;
 CRITICAL_SECTION g_csConsole; 
 CRITICAL_SECTION g_csClientList; 
+CRITICAL_SECTION g_numSockCntxt;
+CRITICAL_SECTION g_csSockCntxtMap;
+CRITICAL_SECTION g_csSockCntxtCleanUp;
 HANDLE g_hIOCompletionPort = NULL;
-std::vector<SocketContext*> g_ClientContext;
+std::vector<std::shared_ptr<SocketContext>> g_ClientContext;
 WSAEVENT g_hAcceptEvent;
 
+int SOCK_CNTXT_COUNT = 0;
 
 int main(int argc, char* argv[])
 {
@@ -50,7 +57,7 @@ int main(int argc, char* argv[])
 	SOCKET ListenSocket;
 
 	struct sockaddr_in ServerAddress;
-	
+
 	//Overlapped I/O follows the model established in Windows and can be performed only on 
 	//sockets created through the WSASocket function 
 	ListenSocket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -163,6 +170,15 @@ bool Initialize()
 	//Initialize the Client List Critical Section
 	InitializeCriticalSection(&g_csClientList);
 
+	//Initialize the Client List Critical Section
+	InitializeCriticalSection(&g_numSockCntxt);
+
+	//Initialize the Socket context map Critical Section
+	InitializeCriticalSection(&g_csSockCntxtMap);
+
+	//Initialize the Socket context map Critical Section
+	InitializeCriticalSection(&g_csSockCntxtCleanUp);
+
 	//Create shutdown event
 	g_hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
@@ -250,6 +266,15 @@ void DeInitialize()
 	//Delete the Client List Critical Section.
 	DeleteCriticalSection(&g_csClientList);
 
+	//Delete the Client List Critical Section.
+	DeleteCriticalSection(&g_numSockCntxt);
+
+	//Delete the Socket Context map Critical Section.
+	DeleteCriticalSection(&g_csSockCntxtMap);
+
+	//Delete the Socket Context map Critical Section.
+	DeleteCriticalSection(&g_csSockCntxtCleanUp);
+
 	//Cleanup IOCP.
 	CloseHandle(g_hIOCompletionPort);
 
@@ -290,77 +315,124 @@ DWORD WINAPI AcceptThread(LPVOID lParam)
 //This function will process the accept event
 void AcceptConnection(SOCKET ListenSocket)
 {
+	BOOL status = TRUE;
+	std::shared_ptr<SocketContext> pClientContext = nullptr;
+	std::shared_ptr<SocketContext> pRemoteSocketContext = nullptr;
+	SOCKET Socket = NULL;
+
+	IncrementSocketContextCount();
+
 	sockaddr_in ClientAddress;
 	int nClientLength = sizeof(ClientAddress);
 	
 	//Accept remote connection attempt from the client
-	SOCKET Socket = WSAAccept(ListenSocket, (sockaddr*)&ClientAddress, &nClientLength, NULL, 0);
+	Socket = WSAAccept(ListenSocket, (sockaddr*)&ClientAddress, &nClientLength, NULL, 0);
 
 	if (INVALID_SOCKET == Socket)
 	{
 		WriteToConsole("\nError occurred while accepting socket: %ld.", WSAGetLastError());
+		status = FALSE;
+		goto Exit;
 	}
 
 	//Display Client's IP
 	WriteToConsole("\nClient connected from: %s", inet_ntoa(ClientAddress.sin_addr));
 
 	//Create a new ClientContext for this newly accepted client
-	SocketContext* pClientContext = new SocketContext;
-
-	pClientContext->SetOpCode(OP_READ);
+	pClientContext = std::make_shared<SocketContext>();
 	pClientContext->SetSocket(Socket);
-
-	//Store this object
-	AddToClientList(pClientContext);
+	pClientContext->SetId(SOCK_CNTXT_COUNT);
 
 	//Create remote connection
-	SocketContext* pRemoteSocketContext = InitRemoteConnection(pClientContext);
+	pRemoteSocketContext = InitRemoteConnection(pClientContext);
 
 	if (pRemoteSocketContext == NULL) 
 	{
 		WriteToConsole("\nShutting down client socket.");
-		RemoveFromClientListAndFreeMemory(pClientContext);
-		return;
+		status = FALSE;
+		goto Exit;
 	}
 
-	//Add Remote socket context to client context
-	pClientContext->SetFwdScoketContext(pRemoteSocketContext);
+	//This is the right place to link two sockets
+	pClientContext->SetBuddySocketContext(pRemoteSocketContext);
+	pRemoteSocketContext->SetBuddySocketContext(pClientContext);
 
-	if (true == AssociateWithIOCP(pClientContext))
+	//Associate both local and remote socket with IOCP.
+	if (false == AssociateWithIOCP(pClientContext))
 	{
-		//Once the data is successfully received, we will print it.
-		pClientContext->SetOpCode(OP_WRITE);
+		WriteToConsole("\nError associating local socket with IOCP.");
+		status = FALSE;
+		goto Exit;
+	}
 
-		WSABUF* p_wbuf = pClientContext->GetWSABUFPtr();
-		OVERLAPPED* p_ol = pClientContext->GetOVERLAPPEDPtr();
+	if (false == AssociateWithIOCP(pRemoteSocketContext))
+	{
+		WriteToConsole("\nError associating remote proxy socket with IOCP.");
+		status = FALSE;
+		goto Exit;
+	}
+	
+	//This is the right place to store socket contexts
+	AddToClientList(pClientContext);
+	AddToClientList(pRemoteSocketContext);
+	
+	//Post initial Recv
+	//This is a right place to post a initial Recv
+	//Posting a initial Recv in WorkerThread will create scalability issues.
+	if (FALSE == pClientContext->Recv())
+	{
+		WriteToConsole("\nError in Initial Post.");
+		status = FALSE;
+		goto Exit;
+	}
 
-		//Get data.
-		DWORD dwFlags = 0;
-		DWORD dwBytes = 0;
+	if (FALSE == pRemoteSocketContext->Recv())
+	{
+		WriteToConsole("\nError in Initial Post.");
+		status = FALSE;
+		goto Exit;
+	}
+	
+	WriteToConsole("\nNumber of objects sharing Client socket: %ld", pClientContext.use_count());
+	WriteToConsole("\nNumber of objects sharing Remote socket: %ld", pRemoteSocketContext.use_count());
 
-		//Post initial Recv
-		//This is a right place to post a initial Recv
-		//Posting a initial Recv in WorkerThread will create scalability issues.
-		int nBytesRecv = WSARecv(pClientContext->GetSocket(), p_wbuf, 1,
-			&dwBytes, &dwFlags, p_ol, NULL);
-
-		if ((SOCKET_ERROR == nBytesRecv) && (WSA_IO_PENDING != WSAGetLastError()))
+Exit:
+	if (FALSE == status) 
+	{
+		if (Socket)
 		{
-			WriteToConsole("\nError in Initial Post.");
+			closesocket(Socket);
+			Socket = NULL;
+		}
+		if (pClientContext || pRemoteSocketContext)
+		{
+			RemoveFromClientListAndCleanUpMemory(pClientContext);
+			pClientContext = nullptr;
+
+			WriteToConsole("\nClient list size after socket context deletion %d", g_ClientContext.size());
+
+			RemoveFromClientListAndCleanUpMemory(pRemoteSocketContext);
+			pRemoteSocketContext = nullptr;
+
+			WriteToConsole("\nClient list size after socket context deletion %d", g_ClientContext.size());
 		}
 	}
 }
 
 //Create connection to remote server socket
 //TODO: get destination server address here
-SocketContext* InitRemoteConnection(SocketContext* pClientContext) 
+std::shared_ptr<SocketContext> InitRemoteConnection(std::shared_ptr<SocketContext> pClientContext)
 {
+	BOOL status = TRUE;
+
+	IncrementSocketContextCount();
+
 	const SIZE_T REDIRECT_RECORDS_SIZE = 2048;
 	const SIZE_T REDIRECT_CONTEXT_SIZE = sizeof(SOCKADDR_STORAGE) * 2;
 
-	UINT32 status;
-	SOCKET remoteProxySocket;
-	SocketContext* pRemoteSockContext = NULL;
+	UINT32 wsaStatus;
+	SOCKET remoteProxySocket = NULL;
+	std::shared_ptr<SocketContext> pRemoteSockContext = nullptr;
 
 	BYTE** pRedirectRecords = 0;
 	BYTE** pRedirectContext = 0;
@@ -377,7 +449,7 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 	HLPR_NEW_ARRAY(pRemoteSockAddrStorage, SOCKADDR_STORAGE, 1);
 	
 	//Opaque data to be set on proxy connection
-	status = WSAIoctl(pClientContext->GetSocket(),
+	wsaStatus = WSAIoctl(pClientContext->GetSocket(),
 					  SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS,
 					  0, 
 					  0,
@@ -387,14 +459,15 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 					  0, 
 					  0);
 
-	if (NO_ERROR != status)
+	if (NO_ERROR != wsaStatus)
 	{
 		WriteToConsole("\nUnable to get redirect records from socket: %ld", WSAGetLastError());
+		status = FALSE;
 		goto Exit;
 	}
 	
 	//Callout allocated data, contains original destination information
-	status = WSAIoctl(pClientContext->GetSocket(),
+	wsaStatus = WSAIoctl(pClientContext->GetSocket(),
 					  SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
 					  0,
 				      0,
@@ -404,9 +477,10 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 					  0,
 					  0);
 
-	if (NO_ERROR != status)
+	if (NO_ERROR != wsaStatus)
 	{
 		WriteToConsole("\nUnable to get redirect context from socket: %ld", WSAGetLastError());
+		status = FALSE;
 		goto Exit;
 	}
 	
@@ -415,21 +489,16 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 				  &(((SOCKADDR_STORAGE*)pRedirectContext)[0]), 
 				  sizeof(SOCKADDR_STORAGE));
 	
-	//Cleanup, init and copy
-	//ZeroMemory((char*)&RemoteAddr, sizeof(RemoteAddr));
-	//CopyMemory((SOCKADDR_IN*)&RemoteAddr, pRemoteSockAddrStorage, sizeof(SOCKADDR_STORAGE));
-
-	//WriteToConsole("Remote address - %s", inet_ntoa(RemoteAddr.sin_addr));
-
 	remoteProxySocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
 	
 	if (INVALID_SOCKET == remoteProxySocket)
 	{
 		WriteToConsole("\nError occured while opening socket: %ld", WSAGetLastError());
+		status = FALSE;
 		goto Exit;
 	}
-
-	status = WSAIoctl(remoteProxySocket,
+	
+	wsaStatus = WSAIoctl(remoteProxySocket,
 					  SIO_SET_WFP_CONNECTION_REDIRECT_RECORDS,
 					  (BYTE*)pRedirectRecords,
 					  (DWORD)redirectRecordsSize,
@@ -439,9 +508,10 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 					  0,
 					  0);
 
-	if (NO_ERROR != status)
+	if (NO_ERROR != wsaStatus)
 	{
 		WriteToConsole("\nUnable to set redirect records on socket: %ld", WSAGetLastError());
+		status = FALSE;
 		goto Exit;
 	}
 
@@ -456,67 +526,59 @@ SocketContext* InitRemoteConnection(SocketContext* pClientContext)
 		//goto Exit;
 	}
 
-	/*
-	//Cleanup and Init with 0 the ServerAddress
-	ZeroMemory((char*)&RemoteAddr, sizeof(RemoteAddr));
-
-	//Fill up the address structure
-	RemoteAddr.sin_family = AF_INET;
-	RemoteAddr.sin_addr.s_addr = inet_addr("18.136.42.214");
-	RemoteAddr.sin_port = htons(80);
-	*/
 	
-	status = WSAConnect(remoteProxySocket, (SOCKADDR*)pRemoteSockAddrStorage, sizeof(SOCKADDR_STORAGE), 0, 0, 0, 0);
+	//RemoteAddr.sin_addr.s_addr = inet_addr("18.136.42.214");
 
-	if (SOCKET_ERROR == status)
+	wsaStatus = WSAConnect(remoteProxySocket, (SOCKADDR*)pRemoteSockAddrStorage, sizeof(SOCKADDR_STORAGE), 0, 0, 0, 0);
+
+	if (SOCKET_ERROR == wsaStatus)
 	{
 		WriteToConsole("\nError occured while connecting to remote server: %ld", WSAGetLastError());
+		status = FALSE;
 		goto Exit;
 	}
 	
-	pRemoteSockContext = new SocketContext;
+	pRemoteSockContext = std::make_shared<SocketContext>();
 	
-	pRemoteSockContext->SetOpCode(OP_WRITE);
 	pRemoteSockContext->SetProxySocket(TRUE);
 	pRemoteSockContext->SetSocket(remoteProxySocket);
-	pRemoteSockContext->SetFwdScoketContext(pClientContext);
-
-	AddToClientList(pRemoteSockContext);
-
-	if (true == AssociateWithIOCP(pRemoteSockContext))
-	{
-		WriteToConsole("\nAssociated remote socket with IOCP.");
-	}
+	pRemoteSockContext->SetId(SOCK_CNTXT_COUNT);
 
 Exit:
+	if (FALSE == status)
+	{
+		if (remoteProxySocket)
+		{
+			closesocket(remoteProxySocket);
+			remoteProxySocket = NULL;
+		}
+		if (NULL != pRemoteSockContext)
+		{
+			//delete pRemoteSockContext;
+			//pRemoteSockContext = NULL;
+			pRemoteSockContext = nullptr;
+		}
+	}
+	
 	HLPR_DELETE_ARRAY(pRedirectContext);
 	HLPR_DELETE_ARRAY(pRedirectRecords);
 	HLPR_DELETE_ARRAY(pRemoteSockAddrStorage);
 
-	if (pRemoteSockContext != NULL) 
-	{
-		return pRemoteSockContext;
-	}
-
-	if (remoteProxySocket)
-	{
-		closesocket(remoteProxySocket);
-	}
-
-	return NULL;
+	return pRemoteSockContext;
 }
 
-bool AssociateWithIOCP(SocketContext* pClientContext)
+bool AssociateWithIOCP(std::shared_ptr<SocketContext> &pClientContext)
 {
 	//Associate the socket with IOCP
-	HANDLE hTemp = CreateIoCompletionPort((HANDLE)pClientContext->GetSocket(), g_hIOCompletionPort, (DWORD)pClientContext, 0);
+	//here we are only passing reference to our client context
+	HANDLE hTemp = CreateIoCompletionPort((HANDLE)pClientContext->GetSocket(), g_hIOCompletionPort, (DWORD)&pClientContext, 0);
 
 	if (NULL == hTemp)
 	{
 		WriteToConsole("\nError occurred while executing CreateIoCompletionPort().");
 
 		//Let's not work with this client
-		RemoveFromClientListAndFreeMemory(pClientContext);
+		RemoveFromClientListAndCleanUpMemory(pClientContext);
 
 		return false;
 	}
@@ -524,177 +586,6 @@ bool AssociateWithIOCP(SocketContext* pClientContext)
 	return true;
 }
 
-/*
-//Worker thread will service IOCP requests
-DWORD WINAPI WorkerThread(LPVOID lpParam)
-{
-	int nThreadNo = (int)lpParam;
-
-	void* lpContext = NULL;
-	OVERLAPPED* pOverlapped = NULL;
-	SocketContext* pClientContext = NULL;
-	DWORD dwBytesTransfered = 0;
-	int nBytesRecv = 0;
-	int nBytesSent = 0;
-	DWORD dwBytes = 0, dwFlags = 0;
-
-	WSABUF* p_wbuf;
-	OVERLAPPED* p_ol;
-
-	//Worker thread will be around to process requests, until a Shutdown event is not Signaled.
-	while (WAIT_OBJECT_0 != WaitForSingleObject(g_hShutdownEvent, 0))
-	{
-		BOOL bReturn = GetQueuedCompletionStatus(
-			g_hIOCompletionPort,
-			&dwBytesTransfered,
-			(LPDWORD)&lpContext,
-			&pOverlapped,
-			INFINITE);
-
-		if (NULL == lpContext)
-		{
-			//We are shutting down
-			break;
-		}
-
-		//Get the client context
-		pClientContext = (SocketContext*)lpContext;
-
-		if ((FALSE == bReturn) || ((TRUE == bReturn) && (0 == dwBytesTransfered)))
-		{
-			//Client connection gone, remove it.
-			RemoveFromClientListAndFreeMemory(pClientContext);
-			continue;
-		}
-		
-		if (TRUE == pClientContext->GetProxySocket())
-		{
-			WriteToConsole("\nPROXY SOCKET: READ or WRITE operation needs to be done.");
-		}
-		else
-		{
-			WriteToConsole("\nLOCAL SOCKET: READ or WRITE operation needs to be done.");
-		}
-
-		switch (pClientContext->GetOpCode())
-		{
-		case OP_READ:
-
-			p_wbuf = pClientContext->GetWSABUFPtr();
-			p_ol = pClientContext->GetOVERLAPPEDPtr();
-
-			pClientContext->IncrSentBytes(dwBytesTransfered);
-
-			//Write operation was finished, see if all the data was sent.
-			//Else post another write.
-			if (pClientContext->GetSentBytes() < pClientContext->GetTotalBytes())
-			{
-				pClientContext->SetOpCode(OP_READ);
-
-				p_wbuf->buf += pClientContext->GetSentBytes(); //why this??
-				p_wbuf->len = pClientContext->GetTotalBytes() - pClientContext->GetSentBytes();
-
-				dwFlags = 0;
-
-				//Overlapped send
-				nBytesSent = WSASend(pClientContext->GetSocket(), p_wbuf, 1,
-					&dwBytes, dwFlags, p_ol, NULL);
-
-				if ((SOCKET_ERROR == nBytesSent) && (WSA_IO_PENDING != WSAGetLastError()))
-				{
-					//Let's not work with this client
-					RemoveFromClientListAndFreeMemory(pClientContext);
-				}
-			}
-			else
-			{
-				if (TRUE == pClientContext->GetProxySocket())
-				{
-					WriteToConsole("\nPROXY SOCKET: WSARecv.");
-				}
-				else
-				{
-					WriteToConsole("\nLOCAL SOCKET: WSARecv.");
-				}
-
-				//Once the data is successfully received, we will print it.
-				pClientContext->SetOpCode(OP_WRITE);
-				pClientContext->ResetWSABUF();
-
-				dwFlags = 0;
-
-				//Get the data.
-				nBytesRecv = WSARecv(pClientContext->GetSocket(), p_wbuf, 1,
-					&dwBytes, &dwFlags, p_ol, NULL);
-
-				if ((SOCKET_ERROR == nBytesRecv) && (WSA_IO_PENDING != WSAGetLastError()))
-				{
-					WriteToConsole("\nThread %d: Error occurred while executing WSARecv().", nThreadNo);
-
-					//Let's not work with this client
-					RemoveFromClientListAndFreeMemory(pClientContext);
-				}
-			}
-
-			break;
-
-		case OP_WRITE:
-
-			char szBuffer[MAX_BUFFER_LEN];
-			SocketContext* pFwd_SocketContext;
-
-			//Display the message we recevied
-			pClientContext->GetBuffer(szBuffer);
-
-			WriteToConsole("\nThread %d: The following message was received: %s", nThreadNo, szBuffer);
-
-			//Forward message to fwd socket
-			pFwd_SocketContext = pClientContext->GetFwdScoketContext();
-
-			if (pFwd_SocketContext == NULL)
-			{
-				WriteToConsole("\nThread %d: No Fwd Socket associated with this socket context.", nThreadNo);
-
-				//Let's not work with this client
-				RemoveFromClientListAndFreeMemory(pClientContext);
-				break;
-			}
-
-			p_wbuf = pFwd_SocketContext->GetWSABUFPtr();
-			p_ol = pFwd_SocketContext->GetOVERLAPPEDPtr();
-
-			pFwd_SocketContext->SetOpCode(OP_READ);
-			
-			pFwd_SocketContext->SetTotalBytes(dwBytesTransfered);
-			pFwd_SocketContext->SetSentBytes(0);
-
-			p_wbuf->len = dwBytesTransfered;
-			pFwd_SocketContext->SetBuffer(szBuffer);
-
-			dwFlags = 0;
-
-			nBytesSent = WSASend(pFwd_SocketContext->GetSocket(), p_wbuf, 1,
-				&dwBytes, dwFlags, p_ol, NULL);
-
-			if ((SOCKET_ERROR == nBytesSent) && (WSA_IO_PENDING != WSAGetLastError()))
-			{
-				WriteToConsole("\nThread %d: Error occurred while executing WSASend().", nThreadNo);
-
-				//Let's not work with this client
-				RemoveFromClientListAndFreeMemory(pFwd_SocketContext);
-			}
-
-			break;
-
-		default:
-			//We should never be reaching here, under normal circumstances.
-			break;
-		} // switch
-	} // while
-
-	return 0;
-}
-*/
 
 //Function to synchronize console output
 //Threads need to be synchronized while they write to console.
@@ -714,8 +605,26 @@ void WriteToConsole(const char* szFormat, ...)
 	LeaveCriticalSection(&g_csConsole);
 }
 
+void IncrementSocketContextCount()
+{
+	EnterCriticalSection(&g_numSockCntxt);
+
+	SOCK_CNTXT_COUNT++;
+
+	LeaveCriticalSection(&g_numSockCntxt);
+}
+
+void DecrementSocketContextCount()
+{
+	EnterCriticalSection(&g_numSockCntxt);
+
+	SOCK_CNTXT_COUNT--;
+
+	LeaveCriticalSection(&g_numSockCntxt);
+}
+
 //Store client related information in a vector
-void AddToClientList(SocketContext* pClientContext)
+void AddToClientList(std::shared_ptr<SocketContext> &pClientContext)
 {
 	EnterCriticalSection(&g_csClientList);
 
@@ -725,36 +634,33 @@ void AddToClientList(SocketContext* pClientContext)
 	LeaveCriticalSection(&g_csClientList);
 }
 
-//This function will allow to remove one single client out of the list
-//TODO: modify to remove remote socket context
-void RemoveFromClientListAndFreeMemory(SocketContext* pClientContext, int depth)
+//This function will allow to remove socket contexts out of the list
+void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext> pClientContext)
 {
-	//Cleanup fwd socket for client context
-	if (depth == 1 && pClientContext->GetFwdScoketContext() != NULL)
-	{
-		RemoveFromClientListAndFreeMemory(pClientContext->GetFwdScoketContext(), 0);
-	}
-
 	EnterCriticalSection(&g_csClientList);
-
-	//WriteToConsole("\nClient list size %d", g_ClientContext.size());
-
-	std::vector <SocketContext*>::iterator IterClientContext;
-
+	
+	std::vector <std::shared_ptr<SocketContext>>::iterator IterClientContext;
+	
 	//Remove the supplied ClientContext from the list and release the memory
 	for (IterClientContext = g_ClientContext.begin(); IterClientContext != g_ClientContext.end(); IterClientContext++)
 	{
 		if (pClientContext == *IterClientContext)
 		{
 			g_ClientContext.erase(IterClientContext);
-
-			//i/o will be cancelled and socket will be closed by destructor.
-			delete pClientContext;
+			
+			WriteToConsole("\nNumber of objects sharing this socket: %ld", pClientContext.use_count());
+			
+			if (pClientContext.use_count() > 0)
+			{
+				//i/o will be cancelled and socket will be closed by destructor.
+				//delete pClientContext;
+				pClientContext = nullptr;
+			}
+			
+			WriteToConsole("\nNumber of objects sharing this socket: %ld", pClientContext.use_count());
 			break;
 		}
 	}
-
-	WriteToConsole("\nClient list size after client context deletion %d", g_ClientContext.size());
 
 	LeaveCriticalSection(&g_csClientList);
 }
@@ -764,18 +670,55 @@ void CleanClientList()
 {
 	EnterCriticalSection(&g_csClientList);
 
-	std::vector <SocketContext*>::iterator IterClientContext;
+	std::vector <std::shared_ptr<SocketContext>>::iterator IterClientContext;
 
 	for (IterClientContext = g_ClientContext.begin(); IterClientContext != g_ClientContext.end(); IterClientContext++)
 	{
 		//i/o will be cancelled and socket will be closed by destructor.
-		delete* IterClientContext;
+		//delete* IterClientContext;
+		*IterClientContext = nullptr;
 	}
 
 	g_ClientContext.clear();
 
 	LeaveCriticalSection(&g_csClientList);
 }
+
+/*
+	Functions for socket context map operations
+*/
+/*
+void StoreInSocketContextMap(SocketContext* localSocket, SocketContext* remoteSocket)
+{
+	EnterCriticalSection(&g_csSockCntxtMap);
+
+	g_SockCntxtMap[localSocket] = remoteSocket;
+	g_SockCntxtMap[remoteSocket] = localSocket;
+	
+	LeaveCriticalSection(&g_csSockCntxtMap);
+}
+
+SocketContext* GetFwdSockCntxtFromMap(SocketContext* s)
+{
+	SocketContext* fwdSockCntxt = NULL;
+
+	EnterCriticalSection(&g_csSockCntxtMap);
+
+	fwdSockCntxt = g_SockCntxtMap[s];
+
+	LeaveCriticalSection(&g_csSockCntxtMap);
+
+	return fwdSockCntxt;
+}
+
+void RemoveSockCntxtFromMap(SocketContext* sToDelete)
+{
+	EnterCriticalSection(&g_csSockCntxtMap);
+	
+	g_SockCntxtMap.erase(sToDelete);
+	
+	LeaveCriticalSection(&g_csSockCntxtMap);
+}*/
 
 //The use of static variable will ensure that 
 //we will make a call to GetSystemInfo() 
