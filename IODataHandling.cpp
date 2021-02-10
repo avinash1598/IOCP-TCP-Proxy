@@ -35,12 +35,8 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 			break;
 		}
 		WriteToConsole("\nThread %d: Inside worker thread: %ld", nThreadNo);
-		std::shared_ptr<SocketContext>* temp = static_cast<std::shared_ptr<SocketContext>*>(lpContext);
-		std::shared_ptr<SocketContext> pClientContext = *temp;
-		//std::shared_ptr<SocketContext> pClientContext = std::make_shared<SocketContext>(*temp->get());
-		//WriteToConsole("\nThread %d: Number of objects sharing this socket: %ld", nThreadNo, pClientContext.use_count());
-		//create smart_pointer instead
-		//SocketContext* pClientContext = (SocketContext*)lpContext;
+		
+		std::shared_ptr<SocketContext> pClientContext = *static_cast<std::shared_ptr<SocketContext>*>(lpContext);
 		PIO_OPERATION_DATA pIoData = (PIO_OPERATION_DATA)pOverlapped;
 
 		//Socket type
@@ -109,10 +105,10 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 		if (FALSE == status)
 		{
 			WriteToConsole("\nThread %d %s: Status is FALSE.", nThreadNo, sock_type);
-			//RemoveFromClientListAndCleanUpMemory(pClientContext);
+			RemoveFromClientListAndCleanUpMemory(pClientContext);
 		}
 
-		//WriteToConsole("\nThread %d: Number of objects sharing this socket: %ld", nThreadNo, pClientContext.use_count());
+		WriteToConsole("\nThread %d: Number of objects sharing this socket: %ld", nThreadNo, pClientContext.use_count());
 	} // while
 
 	return 0;

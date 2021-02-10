@@ -357,6 +357,10 @@ void AcceptConnection(SOCKET ListenSocket)
 	pClientContext->SetBuddySocketContext(pRemoteSocketContext);
 	pRemoteSocketContext->SetBuddySocketContext(pClientContext);
 
+	//This is the right place to store socket contexts
+	AddToClientList(pClientContext);
+	AddToClientList(pRemoteSocketContext);
+
 	//Associate both local and remote socket with IOCP.
 	if (false == AssociateWithIOCP(pClientContext))
 	{
@@ -371,10 +375,6 @@ void AcceptConnection(SOCKET ListenSocket)
 		status = FALSE;
 		goto Exit;
 	}
-	
-	//This is the right place to store socket contexts
-	AddToClientList(pClientContext);
-	AddToClientList(pRemoteSocketContext);
 	
 	//Post initial Recv
 	//This is a right place to post a initial Recv
@@ -571,7 +571,11 @@ bool AssociateWithIOCP(std::shared_ptr<SocketContext> &pClientContext)
 {
 	//Associate the socket with IOCP
 	//here we are only passing reference to our client context
-	HANDLE hTemp = CreateIoCompletionPort((HANDLE)pClientContext->GetSocket(), g_hIOCompletionPort, (DWORD)&pClientContext, 0);
+	//Get socket context from list. 
+	HANDLE hTemp = CreateIoCompletionPort((HANDLE)pClientContext->GetSocket(), 
+										  g_hIOCompletionPort, 
+										  (DWORD)&GetSocketContextFromList(pClientContext), 
+										  0);
 
 	if (NULL == hTemp)
 	{
@@ -635,7 +639,7 @@ void AddToClientList(std::shared_ptr<SocketContext> &pClientContext)
 }
 
 //This function will allow to remove socket contexts out of the list
-void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext> pClientContext)
+void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext>& pClientContext)
 {
 	EnterCriticalSection(&g_csClientList);
 	
@@ -663,6 +667,27 @@ void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext> pClient
 	}
 
 	LeaveCriticalSection(&g_csClientList);
+}
+
+std::shared_ptr<SocketContext>& GetSocketContextFromList(std::shared_ptr<SocketContext> &pClientContext)
+{
+	EnterCriticalSection(&g_csClientList);
+
+	std::vector <std::shared_ptr<SocketContext>>::iterator IterClientContext;
+
+	//Remove the supplied ClientContext from the list and release the memory
+	for (IterClientContext = g_ClientContext.begin(); IterClientContext != g_ClientContext.end(); IterClientContext++)
+	{
+		if (pClientContext == *IterClientContext)
+		{
+			break;
+		}
+	}
+
+	LeaveCriticalSection(&g_csClientList);
+
+	//Before returning check if it is valid
+	return *IterClientContext;
 }
 
 //Clean up the list, this function will be executed at the time of shutdown
