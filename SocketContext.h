@@ -9,7 +9,7 @@
 #define OP_WRITE    1
 
 //Buffer Length 
-#define MAX_BUFFER_LEN 2048
+#define MAX_BUFFER_LEN 128
 
 //Structure to hold all the send and receive events
 /*
@@ -193,12 +193,15 @@ public:
 //map class can also be used.
 //Link list can also be created.
 extern std::vector<std::shared_ptr<SocketContext>> g_ClientContext;
+extern std::unordered_map<int, std::shared_ptr<SocketContext>> g_SocketContextMap;
 
 bool AssociateWithIOCP(std::shared_ptr<SocketContext> &pClientContext);
 void AddToClientList(std::shared_ptr<SocketContext> &pClientContext);
 void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext>& pClientContext);
 void CleanClientList();
 std::shared_ptr<SocketContext> InitRemoteConnection(std::shared_ptr<SocketContext> pClientContext);
-std::shared_ptr<SocketContext>& GetSocketContextFromList(std::shared_ptr<SocketContext>& pClientContext);
+//std::shared_ptr<SocketContext>& GetSocketContextFromList(std::shared_ptr<SocketContext>& pClientContext);
+void AddToSocketContextMap(int SocketId, std::shared_ptr<SocketContext>& pSocketContext);
+std::shared_ptr<SocketContext>& GetFromSocketContextMap(int SocketId);
 
 #endif

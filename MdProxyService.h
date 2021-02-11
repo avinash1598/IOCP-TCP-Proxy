@@ -65,7 +65,6 @@ extern CRITICAL_SECTION g_csConsole; //When threads write to console we need mut
 extern CRITICAL_SECTION g_csClientList; //Need to protect the client list
 extern CRITICAL_SECTION g_numSockCntxt; //Need to protect the socket context count
 extern CRITICAL_SECTION g_csSockCntxtMap; //Critical section for Socket context map
-extern CRITICAL_SECTION g_csSockCntxtCleanUp;
 
 //Global I/O completion port handle
 extern HANDLE g_hIOCompletionPort;

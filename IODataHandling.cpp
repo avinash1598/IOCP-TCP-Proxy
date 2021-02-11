@@ -1,4 +1,5 @@
 #include <winsock2.h>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <thread>
@@ -34,10 +35,19 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 			status = FALSE;
 			break;
 		}
-		WriteToConsole("\nThread %d: Inside worker thread: %ld", nThreadNo);
 		
+		WriteToConsole("\nThread %d: Inside worker thread.", nThreadNo);
+
 		std::shared_ptr<SocketContext> pClientContext = *static_cast<std::shared_ptr<SocketContext>*>(lpContext);
-		PIO_OPERATION_DATA pIoData = (PIO_OPERATION_DATA)pOverlapped;
+		PIO_OPERATION_DATA pIoData = (PIO_OPERATION_DATA)pOverlapped; //could cause bug if added this line here.
+
+		//Check if socket connection is closed
+		if ((FALSE == bReturn) || ((TRUE == bReturn) && (0 == dwBytesTransfered)))
+		{
+			WriteToConsole("\nThread %d %s: Client connection gone.", nThreadNo, sock_type);
+			status = FALSE;
+			goto Exit;
+		}
 
 		//Socket type
 		if (TRUE == pClientContext->GetProxySocket())
@@ -49,14 +59,6 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 		{
 			WriteToConsole("\nThread %d LOCAL SOCKET: Socket Id %d.", nThreadNo, pClientContext->GetId());
 			strcpy(sock_type, "LOCAL SOCKET");
-		}
-
-		//Check is socket connection is closed
-		if ((FALSE == bReturn) || ((TRUE == bReturn) && (0 == dwBytesTransfered)))
-		{
-			WriteToConsole("\nThread %d %s: Client connection gone.", nThreadNo, sock_type);
-			status = FALSE;
-			goto Exit;
 		}
 
 		try
@@ -104,11 +106,12 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 	Exit:
 		if (FALSE == status)
 		{
-			WriteToConsole("\nThread %d %s: Status is FALSE.", nThreadNo, sock_type);
+			WriteToConsole("\nThread %d %s: While loop ended with some error..", nThreadNo, sock_type);
 			RemoveFromClientListAndCleanUpMemory(pClientContext);
 		}
 
-		WriteToConsole("\nThread %d: Number of objects sharing this socket: %ld", nThreadNo, pClientContext.use_count());
+		WriteToConsole("\nThread %d %s: Number of objects sharing this socket: %ld", 
+			nThreadNo, sock_type, pClientContext.use_count());
 	} // while
 
 	return 0;

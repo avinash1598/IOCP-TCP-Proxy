@@ -1,4 +1,5 @@
 #include <winsock2.h>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 
@@ -87,15 +88,7 @@ SocketContext::~SocketContext()
 
 	closesocket(m_Socket);
 
-	//m_pBuddy.Get().reset();
-	/*
-	if (pFwd_SocketContext && (FALSE == pFwd_SocketContext->s_CircularDestructor))
-	{
-		s_CircularDestructor = TRUE;
-		delete pFwd_SocketContext;
-	}
-
-	pFwd_SocketContext = NULL;*/
+	m_pBuddy.Get().reset();
 }
 
 std::shared_ptr<SocketContext> SocketContext::GetBuddySocketContext() const

@@ -5,8 +5,8 @@
 #include <conio.h>
 #include <string.h>
 #include <winsock2.h>
+#include <unordered_map>
 #include <vector>
-//#include <unordered_map>
 #include <Mstcpip.h>
 #include <intsafe.h>
 #include <memory>
@@ -24,9 +24,9 @@ CRITICAL_SECTION g_csConsole;
 CRITICAL_SECTION g_csClientList; 
 CRITICAL_SECTION g_numSockCntxt;
 CRITICAL_SECTION g_csSockCntxtMap;
-CRITICAL_SECTION g_csSockCntxtCleanUp;
 HANDLE g_hIOCompletionPort = NULL;
 std::vector<std::shared_ptr<SocketContext>> g_ClientContext;
+std::unordered_map<int, std::shared_ptr<SocketContext>> g_SocketContextMap;
 WSAEVENT g_hAcceptEvent;
 
 int SOCK_CNTXT_COUNT = 0;
@@ -176,9 +176,6 @@ bool Initialize()
 	//Initialize the Socket context map Critical Section
 	InitializeCriticalSection(&g_csSockCntxtMap);
 
-	//Initialize the Socket context map Critical Section
-	InitializeCriticalSection(&g_csSockCntxtCleanUp);
-
 	//Create shutdown event
 	g_hShutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
@@ -272,9 +269,6 @@ void DeInitialize()
 	//Delete the Socket Context map Critical Section.
 	DeleteCriticalSection(&g_csSockCntxtMap);
 
-	//Delete the Socket Context map Critical Section.
-	DeleteCriticalSection(&g_csSockCntxtCleanUp);
-
 	//Cleanup IOCP.
 	CloseHandle(g_hIOCompletionPort);
 
@@ -336,7 +330,8 @@ void AcceptConnection(SOCKET ListenSocket)
 	}
 
 	//Display Client's IP
-	WriteToConsole("\nClient connected from: %s", inet_ntoa(ClientAddress.sin_addr));
+	WriteToConsole("\nClient connected from: %s with socket id: %d", 
+		inet_ntoa(ClientAddress.sin_addr), SOCK_CNTXT_COUNT);
 
 	//Create a new ClientContext for this newly accepted client
 	pClientContext = std::make_shared<SocketContext>();
@@ -358,8 +353,10 @@ void AcceptConnection(SOCKET ListenSocket)
 	pRemoteSocketContext->SetBuddySocketContext(pClientContext);
 
 	//This is the right place to store socket contexts
-	AddToClientList(pClientContext);
-	AddToClientList(pRemoteSocketContext);
+	//AddToClientList(pClientContext);
+	//AddToClientList(pRemoteSocketContext);
+	AddToSocketContextMap(pClientContext->GetId(), pClientContext);
+	AddToSocketContextMap(pRemoteSocketContext->GetId(), pRemoteSocketContext);
 
 	//Associate both local and remote socket with IOCP.
 	if (false == AssociateWithIOCP(pClientContext))
@@ -381,14 +378,14 @@ void AcceptConnection(SOCKET ListenSocket)
 	//Posting a initial Recv in WorkerThread will create scalability issues.
 	if (FALSE == pClientContext->Recv())
 	{
-		WriteToConsole("\nError in Initial Post.");
+		WriteToConsole("\nError in Initial Post %d.", WSAGetLastError());
 		status = FALSE;
 		goto Exit;
 	}
 
 	if (FALSE == pRemoteSocketContext->Recv())
 	{
-		WriteToConsole("\nError in Initial Post.");
+		WriteToConsole("\nError in Initial Post %d.", WSAGetLastError());
 		status = FALSE;
 		goto Exit;
 	}
@@ -406,6 +403,7 @@ Exit:
 		}
 		if (pClientContext || pRemoteSocketContext)
 		{
+			//Before removing make sure it is not associated with iocp. don't remove if associated with iocp
 			RemoveFromClientListAndCleanUpMemory(pClientContext);
 			pClientContext = nullptr;
 
@@ -526,9 +524,6 @@ std::shared_ptr<SocketContext> InitRemoteConnection(std::shared_ptr<SocketContex
 		//goto Exit;
 	}
 
-	
-	//RemoteAddr.sin_addr.s_addr = inet_addr("18.136.42.214");
-
 	wsaStatus = WSAConnect(remoteProxySocket, (SOCKADDR*)pRemoteSockAddrStorage, sizeof(SOCKADDR_STORAGE), 0, 0, 0, 0);
 
 	if (SOCKET_ERROR == wsaStatus)
@@ -538,6 +533,9 @@ std::shared_ptr<SocketContext> InitRemoteConnection(std::shared_ptr<SocketContex
 		goto Exit;
 	}
 	
+	WriteToConsole("\nRemote socket connected to : %s. Socket Id: %ld", 
+		inet_ntoa(((SOCKADDR_IN*)pRemoteSockAddrStorage)->sin_addr), SOCK_CNTXT_COUNT);
+
 	pRemoteSockContext = std::make_shared<SocketContext>();
 	
 	pRemoteSockContext->SetProxySocket(TRUE);
@@ -552,7 +550,7 @@ Exit:
 			closesocket(remoteProxySocket);
 			remoteProxySocket = NULL;
 		}
-		if (NULL != pRemoteSockContext)
+		if (pRemoteSockContext)
 		{
 			//delete pRemoteSockContext;
 			//pRemoteSockContext = NULL;
@@ -574,7 +572,7 @@ bool AssociateWithIOCP(std::shared_ptr<SocketContext> &pClientContext)
 	//Get socket context from list. 
 	HANDLE hTemp = CreateIoCompletionPort((HANDLE)pClientContext->GetSocket(), 
 										  g_hIOCompletionPort, 
-										  (DWORD)&GetSocketContextFromList(pClientContext), 
+										  (DWORD)&GetFromSocketContextMap(pClientContext->GetId()), 
 										  0);
 
 	if (NULL == hTemp)
@@ -627,6 +625,20 @@ void DecrementSocketContextCount()
 	LeaveCriticalSection(&g_numSockCntxt);
 }
 
+void AddToSocketContextMap(int SocketId, std::shared_ptr<SocketContext> &pSocketContext)
+{
+	EnterCriticalSection(&g_csSockCntxtMap);
+
+	g_SocketContextMap[SocketId] = pSocketContext;
+
+	LeaveCriticalSection(&g_csSockCntxtMap);
+}
+
+std::shared_ptr<SocketContext>& GetFromSocketContextMap(int SocketId)
+{
+	return g_SocketContextMap[SocketId];
+}
+
 //Store client related information in a vector
 void AddToClientList(std::shared_ptr<SocketContext> &pClientContext)
 {
@@ -652,8 +664,6 @@ void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext>& pClien
 		{
 			g_ClientContext.erase(IterClientContext);
 			
-			WriteToConsole("\nNumber of objects sharing this socket: %ld", pClientContext.use_count());
-			
 			if (pClientContext.use_count() > 0)
 			{
 				//i/o will be cancelled and socket will be closed by destructor.
@@ -661,7 +671,7 @@ void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext>& pClien
 				pClientContext = nullptr;
 			}
 			
-			WriteToConsole("\nNumber of objects sharing this socket: %ld", pClientContext.use_count());
+			WriteToConsole("\nDeleted socket context. Use count: %ld", pClientContext.use_count());
 			break;
 		}
 	}
@@ -669,6 +679,7 @@ void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext>& pClien
 	LeaveCriticalSection(&g_csClientList);
 }
 
+/*
 std::shared_ptr<SocketContext>& GetSocketContextFromList(std::shared_ptr<SocketContext> &pClientContext)
 {
 	EnterCriticalSection(&g_csClientList);
@@ -688,7 +699,7 @@ std::shared_ptr<SocketContext>& GetSocketContextFromList(std::shared_ptr<SocketC
 
 	//Before returning check if it is valid
 	return *IterClientContext;
-}
+}*/
 
 //Clean up the list, this function will be executed at the time of shutdown
 void CleanClientList()
@@ -708,42 +719,6 @@ void CleanClientList()
 
 	LeaveCriticalSection(&g_csClientList);
 }
-
-/*
-	Functions for socket context map operations
-*/
-/*
-void StoreInSocketContextMap(SocketContext* localSocket, SocketContext* remoteSocket)
-{
-	EnterCriticalSection(&g_csSockCntxtMap);
-
-	g_SockCntxtMap[localSocket] = remoteSocket;
-	g_SockCntxtMap[remoteSocket] = localSocket;
-	
-	LeaveCriticalSection(&g_csSockCntxtMap);
-}
-
-SocketContext* GetFwdSockCntxtFromMap(SocketContext* s)
-{
-	SocketContext* fwdSockCntxt = NULL;
-
-	EnterCriticalSection(&g_csSockCntxtMap);
-
-	fwdSockCntxt = g_SockCntxtMap[s];
-
-	LeaveCriticalSection(&g_csSockCntxtMap);
-
-	return fwdSockCntxt;
-}
-
-void RemoveSockCntxtFromMap(SocketContext* sToDelete)
-{
-	EnterCriticalSection(&g_csSockCntxtMap);
-	
-	g_SockCntxtMap.erase(sToDelete);
-	
-	LeaveCriticalSection(&g_csSockCntxtMap);
-}*/
 
 //The use of static variable will ensure that 
 //we will make a call to GetSystemInfo() 
