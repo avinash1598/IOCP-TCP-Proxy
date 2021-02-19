@@ -1,11 +1,12 @@
 #include <winsock2.h>
 #include <unordered_map>
-#include <vector>
 #include <memory>
 #include <thread>
 
 #include "MdProxyService.h"
-#include "SocketContext.h"
+
+using namespace std;
+using namespace CPlusPlusLogging;
 
 
 DWORD WINAPI WorkerThread(LPVOID lpParam)
@@ -14,11 +15,13 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 
 	void* lpContext = nullptr;
 	OVERLAPPED* pOverlapped = nullptr;
-	//std::shared_ptr<SocketContext> pClientContext = nullptr;
 	DWORD dwBytesTransfered = 0;
-	char sock_type[] = "LOCAL SOCKET";
+	char sock_type[14];
+	PIO_OPERATION_DATA pIoData;
+	std::shared_ptr<SocketContext> pClientContext = nullptr;
 
-	//Worker thread will be around to process requests, until a Shutdown event is not Signaled.
+	//Worker thread will be around to process requests, 
+	//until a Shutdown event is not Signaled.
 	while (WAIT_OBJECT_0 != WaitForSingleObject(g_hShutdownEvent, 0))
 	{
 		BOOL status = TRUE;
@@ -36,30 +39,21 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 			break;
 		}
 		
-		WriteToConsole("\nThread %d: Inside worker thread.", nThreadNo);
+		LOG_DEBUG("Thread %d: Execution inside worker thread.", nThreadNo);
 
-		std::shared_ptr<SocketContext> pClientContext = *static_cast<std::shared_ptr<SocketContext>*>(lpContext);
-		PIO_OPERATION_DATA pIoData = (PIO_OPERATION_DATA)pOverlapped; //could cause bug if added this line here.
+		pClientContext = *static_cast<std::shared_ptr<SocketContext>*>(lpContext);
+		pClientContext->GetSockType(sock_type);
 
 		//Check if socket connection is closed
 		if ((FALSE == bReturn) || ((TRUE == bReturn) && (0 == dwBytesTransfered)))
 		{
-			WriteToConsole("\nThread %d %s: Client connection gone.", nThreadNo, sock_type);
+			LOG_DEBUG("Thread %d %s %d: connection gone.", 
+				nThreadNo, sock_type, pClientContext->GetId());
 			status = FALSE;
 			goto Exit;
 		}
 
-		//Socket type
-		if (TRUE == pClientContext->GetProxySocket())
-		{
-			WriteToConsole("\nThread %d PROXY SOCKET: Socket id %d.", nThreadNo, pClientContext->GetId());
-			strcpy(sock_type, "PROXY SOCKET");
-		}
-		else
-		{
-			WriteToConsole("\nThread %d LOCAL SOCKET: Socket Id %d.", nThreadNo, pClientContext->GetId());
-			strcpy(sock_type, "LOCAL SOCKET");
-		}
+		pIoData = (PIO_OPERATION_DATA)pOverlapped;
 
 		try
 		{
@@ -67,21 +61,21 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 			{
 			case OP_READ:
 
-				WriteToConsole("\nThread %d %s: Received %ld bytes.", nThreadNo, sock_type, dwBytesTransfered);
+				LOG_DEBUG("Thread %d %s %ld: Received %ld bytes.", nThreadNo, 
+					sock_type, pClientContext->GetId(), dwBytesTransfered);
 
-				//Forward data no longer can be a SocketContext class 
-				//memebr function.
-				//pClientContext->GetRecvBuffer();
 				if (FALSE == pClientContext->Forward(dwBytesTransfered))
 				{
-					WriteToConsole("\nThread %d %s: Error occured while forwading data.", nThreadNo, sock_type);
+					LOG_ERROR("Thread %d %s %ld: Error occured while forwading data.",
+						nThreadNo, sock_type, pClientContext->GetId());
 					status = FALSE;
 					goto Exit;
 				}
 
 				if (FALSE == pClientContext->Recv())
 				{
-					WriteToConsole("\nThread %d %s: Error occured while receiving data.", nThreadNo, sock_type);
+					LOG_ERROR("Thread %d %s %d: Error occured while receiving data.", 
+						nThreadNo, sock_type, pClientContext->GetId());
 					status = FALSE;
 					goto Exit;
 				}
@@ -90,7 +84,8 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 
 			case OP_WRITE:
 
-				WriteToConsole("\nThread %d %s: Sent %ld bytes.", nThreadNo, sock_type, dwBytesTransfered);
+				LOG_DEBUG("Thread %d %s %ld: Sent %ld bytes.", nThreadNo, 
+					sock_type, pClientContext->GetId(), dwBytesTransfered);
 
 				break;
 
@@ -100,18 +95,35 @@ DWORD WINAPI WorkerThread(LPVOID lpParam)
 		}
 		catch (const char* message)
 		{
-			WriteToConsole("\nThread %d %s: Exception occured: %s.", message);
+			LOG_ERROR("Thread %d %s: Exception occured: %s.", message);
 		}
 
 	Exit:
 		if (FALSE == status)
 		{
-			WriteToConsole("\nThread %d %s: While loop ended with some error..", nThreadNo, sock_type);
-			RemoveFromClientListAndCleanUpMemory(pClientContext);
-		}
+			LOG_DEBUG("Thread %d %s %ld: "
+				"Processing of I/O Completion port data failed at some point.", 
+				nThreadNo, sock_type, pClientContext->GetId());
+			
+			//Clean up this socket and its buddy socket
+			pClientContext->SocketAndIOCleanup();
+			pClientContext->GetBuddySocketContext()->SocketAndIOCleanup();
+			SocketContextManager::PutIntoJunkSocketContextMap(
+				pClientContext->GetId());
+			SocketContextManager::PutIntoJunkSocketContextMap(
+				pClientContext->GetBuddySocketContext()->GetId());
 
-		WriteToConsole("\nThread %d %s: Number of objects sharing this socket: %ld", 
-			nThreadNo, sock_type, pClientContext.use_count());
+			/*
+				if (buddysocket not in junk)
+					post completion status
+			*/
+			//PostQueuedCompletionStatus(g_hIOCompletionPort, 0, 
+			//	(DWORD)&SocketContextManager::GetFromMap(pClientContext->GetBuddySocketContext()->GetId()), 
+			//	NULL);
+
+			//LOG_DEBUG("Thread %d: Reference count for socket context: %ld",
+			//	nThreadNo, pClientContext.use_count());
+		}
 	} // while
 
 	return 0;

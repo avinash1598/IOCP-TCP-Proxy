@@ -4,10 +4,16 @@
 //Disable deprecation warnings
 #pragma warning(disable: 4996)
 
+#include "Logger.h"
+#include "SocketContextManager.h"
+
 #define WORKER_THREADS_PER_PROCESSOR 2
 
 //Time out interval for wait calls
 #define WAIT_TIMEOUT_INTERVAL 100
+
+//Thread sleep timeout
+#define THREAD_SLEEP_INTERVAL 10000
 
 //Proxy service port 
 #define PROXY_SERVER_PORT "1598"
@@ -62,9 +68,7 @@ extern HANDLE g_hAcceptThread;
 extern WSAEVENT	g_hAcceptEvent;
 
 extern CRITICAL_SECTION g_csConsole; //When threads write to console we need mutual exclusion
-extern CRITICAL_SECTION g_csClientList; //Need to protect the client list
-extern CRITICAL_SECTION g_numSockCntxt; //Need to protect the socket context count
-extern CRITICAL_SECTION g_csSockCntxtMap; //Critical section for Socket context map
+//extern CRITICAL_SECTION g_csClientList; //Need to protect the client list
 
 //Global I/O completion port handle
 extern HANDLE g_hIOCompletionPort;
@@ -78,11 +82,10 @@ bool Initialize();
 void CleanUp();
 void DeInitialize();
 DWORD WINAPI AcceptThread(LPVOID lParam);
+DWORD WINAPI JunkCleanUpThread(LPVOID lParam);
 void AcceptConnection(SOCKET ListenSocket);
 DWORD WINAPI WorkerThread(LPVOID lpParam);
-void WriteToConsole(const char* szFormat, ...);
+//void WriteToConsole(const char* szFormat, ...);
 int GetNoOfProcessors();
-void IncrementSocketContextCount();
-void DecrementSocketContextCount();
 
 #endif

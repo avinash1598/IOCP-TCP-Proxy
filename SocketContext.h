@@ -9,7 +9,7 @@
 #define OP_WRITE    1
 
 //Buffer Length 
-#define MAX_BUFFER_LEN 128
+#define MAX_BUFFER_LEN 512
 
 //Structure to hold all the send and receive events
 /*
@@ -32,11 +32,13 @@ private:
 	SOCKET                  m_Socket;  //accepted socket
 	int                     m_Id;
 	BOOL                    m_ProxySocket;
-	SocketContext*          pFwd_SocketContext;
-	
+	char                    m_SockType[14];
+	sockaddr_in             m_SockAddress;
+
 	IO_OPERATION_DATA       m_IoRecv;
 	IO_OPERATION_DATA       m_IoSend;
 
+	/*
 	class BuddySocketContextPtr
 	{
 	private:
@@ -53,9 +55,10 @@ private:
 		BuddySocketContextPtr& Set(std::shared_ptr<SocketContext> sc);
 
 		BuddySocketContextPtr& operator=(const std::shared_ptr<SocketContext>);
-	};
+	};*/
 
-	BuddySocketContextPtr     m_pBuddy;
+	//BuddySocketContextPtr     m_pBuddy;
+	std::weak_ptr<SocketContext>     m_pBuddy;
 
 public:
 
@@ -67,20 +70,19 @@ public:
 
 	BOOL Forward(UINT16 length);
 
-	void SetBuddySocketContext(const std::shared_ptr<SocketContext> sc);
+	//void SetBuddySocketContext(const std::shared_ptr<SocketContext> sc);
+	void SetBuddySocketContext(const std::shared_ptr<SocketContext>& sc);
 
+	//std::shared_ptr<SocketContext> GetBuddySocketContext() const;
 	std::shared_ptr<SocketContext> GetBuddySocketContext() const;
 
-	//Get/Set calls
-	void SetFwdScoketContext(SocketContext* socketContext)
-	{
-		pFwd_SocketContext = socketContext;
-	}
+	char* GetSocketIpAddress();
 
-	SocketContext* GetFwdScoketContext()
-	{
-		return pFwd_SocketContext;
-	}
+	void SetSockType(const char* s);
+
+	void GetSockType(char* s);
+
+	void SocketAndIOCleanup();
 
 	void SetProxySocket(BOOL value)
 	{
@@ -110,6 +112,16 @@ public:
 	SOCKET GetSocket()
 	{
 		return m_Socket;
+	}
+
+	void SetSocketAddress(sockaddr_in s) 
+	{
+		m_SockAddress = s;
+	}
+
+	sockaddr_in GetSocketAddress()
+	{
+		return m_SockAddress;
 	}
 
 	void SetRevBuffer(char* RevBuffer)
@@ -167,23 +179,7 @@ public:
 	}
 
 	//Constructor
-	SocketContext()
-	{
-		m_Socket = SOCKET_ERROR;
-
-		ZeroMemory(&m_IoRecv, sizeof(IO_OPERATION_DATA));
-		m_IoRecv.dataBuf.buf = (char*)&m_IoRecv.buffer;
-		m_IoRecv.dataBuf.len = MAX_BUFFER_LEN;
-		m_IoRecv.IoType = OP_READ;
-
-		ZeroMemory(&m_IoSend, sizeof(IO_OPERATION_DATA));
-		m_IoSend.dataBuf.buf = (char*)&m_IoSend.buffer;
-		m_IoSend.dataBuf.len = MAX_BUFFER_LEN;
-		m_IoSend.IoType = OP_WRITE;
-
-		m_ProxySocket = FALSE;
-		//s_CircularDestructor = FALSE;
-	}
+	SocketContext();
 
 	//destructor
 	~SocketContext();
@@ -192,16 +188,10 @@ public:
 //Vector to store pointers of dynamically allocated ClientContext.
 //map class can also be used.
 //Link list can also be created.
-extern std::vector<std::shared_ptr<SocketContext>> g_ClientContext;
-extern std::unordered_map<int, std::shared_ptr<SocketContext>> g_SocketContextMap;
+//extern std::vector<std::shared_ptr<SocketContext>> g_ClientContext;
+//extern std::unordered_map<int, std::shared_ptr<SocketContext>> g_SocketContextMap;
 
 bool AssociateWithIOCP(std::shared_ptr<SocketContext> &pClientContext);
-void AddToClientList(std::shared_ptr<SocketContext> &pClientContext);
-void RemoveFromClientListAndCleanUpMemory(std::shared_ptr<SocketContext>& pClientContext);
-void CleanClientList();
 std::shared_ptr<SocketContext> InitRemoteConnection(std::shared_ptr<SocketContext> pClientContext);
-//std::shared_ptr<SocketContext>& GetSocketContextFromList(std::shared_ptr<SocketContext>& pClientContext);
-void AddToSocketContextMap(int SocketId, std::shared_ptr<SocketContext>& pSocketContext);
-std::shared_ptr<SocketContext>& GetFromSocketContextMap(int SocketId);
 
 #endif

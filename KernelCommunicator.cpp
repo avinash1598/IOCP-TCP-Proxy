@@ -1,6 +1,11 @@
 #include <stdio.h>
 #include <windows.h>
+
+#include "Logger.h"
 #include "KernelCommunicator.h"
+
+using namespace std;
+using namespace CPlusPlusLogging;
 
 BOOL UpdateKernelWithUserAppProcessId() 
 {
@@ -11,7 +16,7 @@ BOOL UpdateKernelWithUserAppProcessId()
 	HANDLE device;
 
 	processId = GetCurrentProcessId();
-	printf("\nCurrent process ID: %ld\n", processId);
+	LOG_INFO("Current process ID: %ld", processId);
 
 	pUserAppData = (PUSERAPP_IOCTL_IN_BUF)malloc(sizeof(USERAPP_IOCTL_IN_BUF));
 	memset(pUserAppData, 0, sizeof(USERAPP_IOCTL_IN_BUF));
@@ -27,7 +32,7 @@ BOOL UpdateKernelWithUserAppProcessId()
 
 	if (device == INVALID_HANDLE_VALUE)
 	{
-		printf_s("> Could not open device: 0x%x\n", GetLastError());
+		LOG_ERROR("Could not open device: 0x%x. Invalid file device handle.", GetLastError());
 		status = FALSE;
 		goto Exit;
 	}
@@ -43,7 +48,7 @@ BOOL UpdateKernelWithUserAppProcessId()
 
 	if (FALSE == status)
 	{
-		printf_s("> Error sending device IO control code: 0x%x\n", GetLastError());
+		LOG_ERROR("Error sending device IO control code: 0x%x", GetLastError());
 		status = FALSE;
 		goto Exit;
 	}
